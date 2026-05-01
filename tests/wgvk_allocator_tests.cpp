@@ -155,6 +155,18 @@ struct RefModel {
     }
 };
 
+// Portable 64-bit popcount. MSVC has no __builtin_popcountll.
+#if defined(_MSC_VER)
+    #include <intrin.h>
+    static inline unsigned wgvk_popcount64(uint64_t x) {
+        return (unsigned)__popcnt64(x);
+    }
+#else
+    static inline unsigned wgvk_popcount64(uint64_t x) {
+        return (unsigned)__builtin_popcountll((unsigned long long)x);
+    }
+#endif
+
 // Count the occupied valid blocks. Skips tail bits in the last L2 word
 // since allocator_create now seeds those to 1 to make saturation logic
 // uniform.
@@ -164,7 +176,7 @@ size_t BitmapPopcount(const VirtualAllocator& a) {
     for (size_t w = 0; w < a.l2_word_count; ++w) {
         size_t valid = (left >= W) ? W : left;
         uint64_t mask = (valid == W) ? ~0ULL : ((1ULL << valid) - 1ULL);
-        c += static_cast<size_t>(__builtin_popcountll(a.level2[w] & mask));
+        c += static_cast<size_t>(wgvk_popcount64(a.level2[w] & mask));
         left -= valid;
     }
     return c;

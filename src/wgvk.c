@@ -9803,6 +9803,22 @@ void wgpuTextureViewSetLabel(WGPUTextureView textureView, WGPUStringView label) 
 #ifndef WGVK_ALLOCATOR_INTERNAL_LINKAGE
 #define WGVK_ALLOCATOR_INTERNAL_LINKAGE static
 #endif
+
+// Count trailing zeros on a 64-bit word. Precondition: x != 0.
+// MSVC has no __builtin_ctzll; use _BitScanForward64 there.
+#if defined(_MSC_VER)
+    #include <intrin.h>
+    static inline unsigned wgvk_ctz64(uint64_t x) {
+        unsigned long idx;
+        _BitScanForward64(&idx, x);
+        return (unsigned)idx;
+    }
+#else
+    static inline unsigned wgvk_ctz64(uint64_t x) {
+        return (unsigned)__builtin_ctzll((unsigned long long)x);
+    }
+#endif
+
 WGVK_ALLOCATOR_INTERNAL_LINKAGE void allocator_destroy(VirtualAllocator* allocator) {
     if (!allocator) return;
     free(allocator->level0);
@@ -9916,7 +9932,7 @@ WGVK_ALLOCATOR_INTERNAL_LINKAGE size_t allocator_alloc(VirtualAllocator* allocat
                 uint64_t l1_search = allocator->level1[l1_w] | l1_below;
 
                 if (l1_search != ~0ULL) {
-                    unsigned first = (unsigned)__builtin_ctzll(~l1_search);
+                    unsigned first = wgvk_ctz64(~l1_search);
                     scan_l2 = l1_w * BITS_PER_WORD + first;
                     break;
                 }
@@ -9930,7 +9946,7 @@ WGVK_ALLOCATOR_INTERNAL_LINKAGE size_t allocator_alloc(VirtualAllocator* allocat
                     uint64_t l0_search = allocator->level0[l0_w] | l0_below;
 
                     if (l0_search != ~0ULL) {
-                        unsigned first = (unsigned)__builtin_ctzll(~l0_search);
+                        unsigned first = wgvk_ctz64(~l0_search);
                         scan_l1 = l0_w * BITS_PER_WORD + first;
                         break;
                     }
@@ -9949,7 +9965,7 @@ WGVK_ALLOCATOR_INTERNAL_LINKAGE size_t allocator_alloc(VirtualAllocator* allocat
         }
 
         // First zero bit at or above l2_bit in the current L2 word.
-        unsigned first_zero = (unsigned)__builtin_ctzll(~l2_search);
+        unsigned first_zero = wgvk_ctz64(~l2_search);
         size_t candidate = l2_word * BITS_PER_WORD + first_zero;
         if (candidate > last_start_block) break;
 
@@ -9975,7 +9991,7 @@ WGVK_ALLOCATOR_INTERNAL_LINKAGE size_t allocator_alloc(VirtualAllocator* allocat
                                   : (((1ULL << take) - 1ULL) << cb);
                 uint64_t conflict = w & mask;
                 if (conflict != 0) {
-                    unsigned cb2 = (unsigned)__builtin_ctzll(conflict);
+                    unsigned cb2 = wgvk_ctz64(conflict);
                     conflict_block = cw * BITS_PER_WORD + cb2;
                     break;
                 }
