@@ -24,6 +24,14 @@
  * SOFTWARE.
  */
 
+// Must be defined before any libc header is pulled in, otherwise the libc
+// header guards (via <features.h>) lock in a smaller POSIX profile and the
+// pthread_*, clock_gettime, nanosleep, usleep, sched_yield decls below
+// silently disappear.
+#ifndef _POSIX_C_SOURCE
+    #define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "wgvk_config.h"
 #include <stdatomic.h>
 #include <stdint.h>
@@ -155,6 +163,18 @@
 
 #else
   #error "Platform not supported"
+#endif
+
+#include <errno.h>
+
+#if defined(_WIN32) || defined(_WIN64)
+    #define WGVK_OS_WINDOWS 1
+    #include <windows.h>
+#else
+    #define WGVK_OS_POSIX 1
+    #include <pthread.h>
+    #include <sched.h>
+    #include <unistd.h>
 #endif
 
 
@@ -3689,7 +3709,7 @@ WGPUPipelineLayout wgpuDeviceCreatePipelineLayout(WGPUDevice device, const WGPUP
     lci.pSetLayouts = dslayouts;
     lci.setLayoutCount = ret->bindGroupLayoutCount;
     VkResult res = device->functions.vkCreatePipelineLayout(device->device, &lci, NULL, &ret->layout);
-    RL_FREE(dslayouts);
+    RL_FREE((void*)dslayouts);
     if(res != VK_SUCCESS){
         wgpuPipelineLayoutRelease(ret);
         ret = NULL;
@@ -6915,8 +6935,8 @@ void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder commandEncoder, c
             .layerCount = srcIs3D ? 1 : copySize->depthOrArrayLayers,
         },
         .srcOffsets = {
-            {source->origin.x, source->origin.y, srcIs3D ? source->origin.z : 0},
-            {source->origin.x + copySize->width, source->origin.y + copySize->height, srcIs3D ? source->origin.z + copySize->depthOrArrayLayers : 1}
+            {(int32_t)source->origin.x, (int32_t)source->origin.y, srcIs3D ? (int32_t)source->origin.z : 0},
+            {(int32_t)(source->origin.x + copySize->width), (int32_t)(source->origin.y + copySize->height), srcIs3D ? (int32_t)(source->origin.z + copySize->depthOrArrayLayers) : 1}
         },
         .dstSubresource = {
             .aspectMask = destination->aspect,
@@ -6924,8 +6944,8 @@ void wgpuCommandEncoderCopyTextureToTexture(WGPUCommandEncoder commandEncoder, c
             .baseArrayLayer = dstIs3D ? 0 : destination->origin.z,
             .layerCount = dstIs3D ? 1 : copySize->depthOrArrayLayers,
         },
-        .dstOffsets[0] = {destination->origin.x, destination->origin.y, dstIs3D ? destination->origin.z : 0},
-        .dstOffsets[1] = {destination->origin.x + copySize->width, destination->origin.y + copySize->height, dstIs3D ? destination->origin.z + copySize->depthOrArrayLayers : 1}
+        .dstOffsets[0] = {(int32_t)destination->origin.x, (int32_t)destination->origin.y, dstIs3D ? (int32_t)destination->origin.z : 0},
+        .dstOffsets[1] = {(int32_t)(destination->origin.x + copySize->width), (int32_t)(destination->origin.y + copySize->height), dstIs3D ? (int32_t)(destination->origin.z + copySize->depthOrArrayLayers) : 1}
     };
     commandEncoder->device->functions.vkCmdBlitImage(
         commandEncoder->buffer,
@@ -9780,7 +9800,10 @@ void wgpuTextureViewSetLabel(WGPUTextureView textureView, WGPUStringView label) 
 // =============================================================================
 // Allocator implementation
 // =============================================================================
-static void allocator_destroy(VirtualAllocator* allocator) {
+#ifndef WGVK_ALLOCATOR_INTERNAL_LINKAGE
+#define WGVK_ALLOCATOR_INTERNAL_LINKAGE static
+#endif
+WGVK_ALLOCATOR_INTERNAL_LINKAGE void allocator_destroy(VirtualAllocator* allocator) {
     if (!allocator) return;
     free(allocator->level0);
     free(allocator->level1);
@@ -9788,7 +9811,13 @@ static void allocator_destroy(VirtualAllocator* allocator) {
     memset(allocator, 0, sizeof(VirtualAllocator));
 }
 
-static bool allocator_create(VirtualAllocator* allocator, size_t size) {
+// Summary semantics (used by alloc fast-path):
+//   level1 bit b in word w is set  <=>  level2[w*64 + b] == ~0ULL  (saturated)
+//   level0 bit b in word w is set  <=>  level1[w*64 + b] == ~0ULL  (saturated)
+// Unused tail bits (beyond total_blocks / l2_word_count / l1_word_count) are
+// pre-set to 1 at create time so the saturation logic is uniform.
+
+WGVK_ALLOCATOR_INTERNAL_LINKAGE bool allocator_create(VirtualAllocator* allocator, size_t size) {
     memset(allocator, 0, sizeof(VirtualAllocator));
     allocator->size_in_bytes = size;
     allocator->total_blocks = size / ALLOCATOR_GRANULARITY;
@@ -9800,14 +9829,41 @@ static bool allocator_create(VirtualAllocator* allocator, size_t size) {
     allocator->level1 = calloc(allocator->l1_word_count, sizeof(uint64_t));
     allocator->level0 = calloc(allocator->l0_word_count, sizeof(uint64_t));
 
-    if (!allocator->level2 || !allocator->level1 || !allocator->level0) {
+    if ((allocator->l2_word_count > 0 && !allocator->level2) ||
+        (allocator->l1_word_count > 0 && !allocator->level1) ||
+        (allocator->l0_word_count > 0 && !allocator->level0)) {
         allocator_destroy(allocator);
         return false;
+    }
+
+    // Seed the unused tail bits in each level as "occupied" / "saturated"
+    // so the alloc fast-path can stop scanning past the valid range
+    // without per-iteration bounds checks.
+    if (allocator->l2_word_count > 0) {
+        size_t valid = allocator->total_blocks - (allocator->l2_word_count - 1) * BITS_PER_WORD;
+        if (valid < BITS_PER_WORD) {
+            uint64_t valid_mask = (valid == 0) ? 0ULL : ((1ULL << valid) - 1ULL);
+            allocator->level2[allocator->l2_word_count - 1] = ~valid_mask;
+        }
+    }
+    if (allocator->l1_word_count > 0) {
+        size_t valid = allocator->l2_word_count - (allocator->l1_word_count - 1) * BITS_PER_WORD;
+        if (valid < BITS_PER_WORD) {
+            uint64_t valid_mask = (valid == 0) ? 0ULL : ((1ULL << valid) - 1ULL);
+            allocator->level1[allocator->l1_word_count - 1] = ~valid_mask;
+        }
+    }
+    if (allocator->l0_word_count > 0) {
+        size_t valid = allocator->l1_word_count - (allocator->l0_word_count - 1) * BITS_PER_WORD;
+        if (valid < BITS_PER_WORD) {
+            uint64_t valid_mask = (valid == 0) ? 0ULL : ((1ULL << valid) - 1ULL);
+            allocator->level0[allocator->l0_word_count - 1] = ~valid_mask;
+        }
     }
     return true;
 }
 
-static size_t allocator_alloc(VirtualAllocator* allocator, size_t size, size_t alignment) {
+WGVK_ALLOCATOR_INTERNAL_LINKAGE size_t allocator_alloc(VirtualAllocator* allocator, size_t size, size_t alignment) {
     if (size == 0) return 0;
     if (size > allocator->size_in_bytes) return OUT_OF_SPACE;
 
@@ -9830,113 +9886,190 @@ static size_t allocator_alloc(VirtualAllocator* allocator, size_t size, size_t a
     if (num_blocks == 0) return 0;
     if (num_blocks > allocator->total_blocks) return OUT_OF_SPACE;
 
-    const size_t last_start_block =
-        allocator->total_blocks - num_blocks; // only these starts can ever fit
+    const size_t align_blocks = alignment / ALLOCATOR_GRANULARITY; // power of two >= 1
+    const size_t align_mask   = align_blocks - 1;
+    const size_t last_start_block = allocator->total_blocks - num_blocks;
 
-    for (size_t i = 0; i <= last_start_block; ) {
-        size_t l2_word_idx = i / BITS_PER_WORD;
-        size_t bit_idx     = i % BITS_PER_WORD;
+    size_t i = 0;
+    while (i <= last_start_block) {
+        // Snap to the next alignment boundary.
+        if ((i & align_mask) != 0) {
+            size_t aligned = (i + align_mask) & ~align_mask;
+            if (aligned < i || aligned > last_start_block) break;
+            i = aligned;
+        }
 
-        // Skip if current start block is occupied.
-        if (((allocator->level2[l2_word_idx] >> bit_idx) & 1ULL) != 0) {
-            ++i;
+        size_t l2_word = i / BITS_PER_WORD;
+        size_t l2_bit  = i % BITS_PER_WORD;
+        uint64_t below_mask = (l2_bit == 0) ? 0ULL : ((1ULL << l2_bit) - 1ULL);
+        uint64_t l2_search  = allocator->level2[l2_word] | below_mask;
+
+        if (l2_search == ~0ULL) {
+            // No free bit at or above l2_bit in this L2 word. Skip ahead
+            // using L1 (and L0) saturation summaries so we don't re-scan
+            // chunks that are known to be entirely full.
+            size_t scan_l2 = l2_word + 1;
+            while (scan_l2 < allocator->l2_word_count) {
+                size_t l1_w = scan_l2 / BITS_PER_WORD;
+                size_t l1_b = scan_l2 % BITS_PER_WORD;
+                uint64_t l1_below = (l1_b == 0) ? 0ULL : ((1ULL << l1_b) - 1ULL);
+                uint64_t l1_search = allocator->level1[l1_w] | l1_below;
+
+                if (l1_search != ~0ULL) {
+                    unsigned first = (unsigned)__builtin_ctzll(~l1_search);
+                    scan_l2 = l1_w * BITS_PER_WORD + first;
+                    break;
+                }
+
+                // Whole L1 word is saturated. Use L0 to skip multiple L1 words.
+                size_t scan_l1 = l1_w + 1;
+                while (scan_l1 < allocator->l1_word_count) {
+                    size_t l0_w = scan_l1 / BITS_PER_WORD;
+                    size_t l0_b = scan_l1 % BITS_PER_WORD;
+                    uint64_t l0_below = (l0_b == 0) ? 0ULL : ((1ULL << l0_b) - 1ULL);
+                    uint64_t l0_search = allocator->level0[l0_w] | l0_below;
+
+                    if (l0_search != ~0ULL) {
+                        unsigned first = (unsigned)__builtin_ctzll(~l0_search);
+                        scan_l1 = l0_w * BITS_PER_WORD + first;
+                        break;
+                    }
+                    scan_l1 = (l0_w + 1) * BITS_PER_WORD;
+                }
+                if (scan_l1 >= allocator->l1_word_count) {
+                    scan_l2 = allocator->l2_word_count;
+                    break;
+                }
+                scan_l2 = scan_l1 * BITS_PER_WORD;
+            }
+            if (scan_l2 >= allocator->l2_word_count) break;
+            i = scan_l2 * BITS_PER_WORD;
+            if (i > last_start_block) break;
             continue;
         }
 
-        // Enforce alignment in bytes, then convert to blocks.
-        size_t offset         = i * ALLOCATOR_GRANULARITY;
-        size_t aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
-        if (aligned_offset != offset) {
-            size_t next_i = aligned_offset / ALLOCATOR_GRANULARITY;
-            if (next_i <= i) ++i; else i = next_i;
-            if (i > last_start_block) break; // cannot fit anymore
+        // First zero bit at or above l2_bit in the current L2 word.
+        unsigned first_zero = (unsigned)__builtin_ctzll(~l2_search);
+        size_t candidate = l2_word * BITS_PER_WORD + first_zero;
+        if (candidate > last_start_block) break;
+
+        if ((candidate & align_mask) != 0) {
+            size_t aligned = (candidate + align_mask) & ~align_mask;
+            if (aligned < candidate || aligned > last_start_block) break;
+            i = aligned;
             continue;
         }
 
-        // Probe forward for a contiguous free run.
-        bool possible = true;
-        for (size_t j = 0; j < num_blocks; ++j) {
-            size_t block_to_check = i + j;
-            // If this start would run past the end, stop the outer loop.
-            if (block_to_check > last_start_block + (num_blocks - 1)) {
-                i = last_start_block + 1; // force exit
-                possible = false;
-                break;
-            }
-            size_t check_l2_word = block_to_check / BITS_PER_WORD;
-            size_t check_bit_idx = block_to_check % BITS_PER_WORD;
-            if (((allocator->level2[check_l2_word] >> check_bit_idx) & 1ULL) != 0) {
-                i = block_to_check + 1; // jump just past first conflict
-                if (i > last_start_block) { possible = false; }
-                else { possible = false; }
-                break;
-            }
-        }
-
-        if (!possible) {
-            continue;
-        }
-
-        // Claim the run.
-        size_t start_block_index = i;
-        for (size_t j = 0; j < num_blocks; ++j) {
-            size_t current_block     = start_block_index + j;
-            size_t current_l2_word   = current_block / BITS_PER_WORD;
-            size_t current_bit_idx   = current_block % BITS_PER_WORD;
-            allocator->level2[current_l2_word] |= (1ULL << current_bit_idx);
-        }
-
-        // Update summary levels.
-        size_t first_l2 = start_block_index / BITS_PER_WORD;
-        size_t last_l2  = (start_block_index + num_blocks - 1) / BITS_PER_WORD;
-        for (size_t l2_idx = first_l2; l2_idx <= last_l2; ++l2_idx) {
-            if (allocator->level2[l2_idx] != 0) {
-                size_t l1_idx = l2_idx / BITS_PER_WORD;
-                size_t l1_bit = l2_idx % BITS_PER_WORD;
-                allocator->level1[l1_idx] |= (1ULL << l1_bit);
-
-                size_t l0_idx = l1_idx / BITS_PER_WORD;
-                size_t l0_bit = l1_idx % BITS_PER_WORD;
-                allocator->level0[l0_idx] |= (1ULL << l0_bit);
+        // Validate the run [candidate, candidate + num_blocks) word-by-word.
+        size_t conflict_block = OUT_OF_SPACE;
+        {
+            size_t cw = candidate / BITS_PER_WORD;
+            size_t cb = candidate % BITS_PER_WORD;
+            size_t remaining = num_blocks;
+            while (remaining > 0) {
+                uint64_t w = allocator->level2[cw];
+                size_t take = BITS_PER_WORD - cb;
+                if (take > remaining) take = remaining;
+                uint64_t mask = (take == BITS_PER_WORD)
+                                  ? ~0ULL
+                                  : (((1ULL << take) - 1ULL) << cb);
+                uint64_t conflict = w & mask;
+                if (conflict != 0) {
+                    unsigned cb2 = (unsigned)__builtin_ctzll(conflict);
+                    conflict_block = cw * BITS_PER_WORD + cb2;
+                    break;
+                }
+                remaining -= take;
+                cw++;
+                cb = 0;
             }
         }
-        return start_block_index * ALLOCATOR_GRANULARITY;
+
+        if (conflict_block == OUT_OF_SPACE) {
+            // Claim the run and update saturation summaries.
+            size_t cw = candidate / BITS_PER_WORD;
+            size_t cb = candidate % BITS_PER_WORD;
+            size_t remaining = num_blocks;
+            while (remaining > 0) {
+                size_t take = BITS_PER_WORD - cb;
+                if (take > remaining) take = remaining;
+                uint64_t mask = (take == BITS_PER_WORD)
+                                  ? ~0ULL
+                                  : (((1ULL << take) - 1ULL) << cb);
+                allocator->level2[cw] |= mask;
+
+                if (allocator->level2[cw] == ~0ULL) {
+                    size_t l1_w = cw / BITS_PER_WORD;
+                    size_t l1_b = cw % BITS_PER_WORD;
+                    uint64_t l1_bit = 1ULL << l1_b;
+                    if ((allocator->level1[l1_w] & l1_bit) == 0) {
+                        allocator->level1[l1_w] |= l1_bit;
+                        if (allocator->level1[l1_w] == ~0ULL) {
+                            size_t l0_w = l1_w / BITS_PER_WORD;
+                            size_t l0_b = l1_w % BITS_PER_WORD;
+                            allocator->level0[l0_w] |= (1ULL << l0_b);
+                        }
+                    }
+                }
+
+                remaining -= take;
+                cw++;
+                cb = 0;
+            }
+            return candidate * ALLOCATOR_GRANULARITY;
+        }
+
+        // Resume search just past the first conflicting block.
+        i = conflict_block + 1;
     }
-
     return OUT_OF_SPACE;
 }
 
 
-static void allocator_free(VirtualAllocator* allocator, size_t offset, size_t size) {
+WGVK_ALLOCATOR_INTERNAL_LINKAGE void allocator_free(VirtualAllocator* allocator, size_t offset, size_t size) {
     if (size == 0) return;
 
     const size_t num_blocks = (size + ALLOCATOR_GRANULARITY - 1) / ALLOCATOR_GRANULARITY;
     const size_t start_block_index = offset / ALLOCATOR_GRANULARITY;
 
-    size_t first_l2_word = start_block_index / BITS_PER_WORD;
-    size_t last_l2_word = (start_block_index + num_blocks - 1) / BITS_PER_WORD;
+    size_t end_block = start_block_index + num_blocks;
+    if (end_block > allocator->total_blocks) end_block = allocator->total_blocks;
+    if (start_block_index >= end_block) return;
 
-    for (size_t i = 0; i < num_blocks; ++i) {
-        size_t current_block = start_block_index + i;
-        if (current_block >= allocator->total_blocks) break;
-        size_t l2_word_idx = current_block / BITS_PER_WORD;
-        size_t bit_idx = current_block % BITS_PER_WORD;
-        allocator->level2[l2_word_idx] &= ~(1ULL << bit_idx);
-    }
+    size_t cw = start_block_index / BITS_PER_WORD;
+    size_t cb = start_block_index % BITS_PER_WORD;
+    size_t remaining = end_block - start_block_index;
 
-    for (size_t l2_idx = first_l2_word; l2_idx <= last_l2_word; ++l2_idx) {
-        if (l2_idx >= allocator->l2_word_count) continue;
-        if (allocator->level2[l2_idx] == 0) {
-            size_t l1_idx = l2_idx / BITS_PER_WORD;
-            size_t l1_bit = l2_idx % BITS_PER_WORD;
-            allocator->level1[l1_idx] &= ~(1ULL << l1_bit);
+    while (remaining > 0) {
+        size_t take = BITS_PER_WORD - cb;
+        if (take > remaining) take = remaining;
+        uint64_t mask = (take == BITS_PER_WORD)
+                          ? ~0ULL
+                          : (((1ULL << take) - 1ULL) << cb);
+        uint64_t before = allocator->level2[cw];
+        uint64_t after  = before & ~mask;
+        allocator->level2[cw] = after;
 
-            if (allocator->level1[l1_idx] == 0) {
-                size_t l0_idx = l1_idx / BITS_PER_WORD;
-                size_t l0_bit = l1_idx % BITS_PER_WORD;
-                allocator->level0[l0_idx] &= ~(1ULL << l0_bit);
+        // Saturation transitions: if the L2 word just left ~0ULL, clear its
+        // L1 bit. If the L1 word in turn left ~0ULL, clear its L0 bit.
+        if (before == ~0ULL && after != ~0ULL) {
+            size_t l1_w = cw / BITS_PER_WORD;
+            size_t l1_b = cw % BITS_PER_WORD;
+            uint64_t l1_bit = 1ULL << l1_b;
+            uint64_t l1_before = allocator->level1[l1_w];
+            if (l1_before & l1_bit) {
+                allocator->level1[l1_w] = l1_before & ~l1_bit;
+                if (l1_before == ~0ULL) {
+                    size_t l0_w = l1_w / BITS_PER_WORD;
+                    size_t l0_b = l1_w % BITS_PER_WORD;
+                    allocator->level0[l0_w] &= ~(1ULL << l0_b);
+                }
             }
         }
+
+        remaining -= take;
+        cw++;
+        cb = 0;
     }
 }
 
@@ -10149,19 +10282,6 @@ RGAPI void wgvkAllocator_free(const wgvkAllocation* allocation) {
 // Threads implementation
 // =============================================================================
 
-#define _POSIX_C_SOURCE 200809L
-
-#include <errno.h>
-
-#if defined(_WIN32) || defined(_WIN64)
-    #define WGVK_OS_WINDOWS 1
-    #include <windows.h>
-#else
-    #define WGVK_OS_POSIX 1
-    #include <pthread.h>
-    #include <sched.h>
-    #include <unistd.h>
-#endif
 
 
 /**

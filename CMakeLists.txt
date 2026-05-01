@@ -96,6 +96,13 @@ else()
 endif()
 set(BUNDLE_LIST "")
 
+# Expose the internal VirtualAllocator helpers (allocator_create/destroy/alloc/free)
+# with extern linkage so they are reachable from the dedicated allocator unit
+# tests. These names are not part of the public API; they are obscure enough not
+# to collide with anything else, and exposing them avoids having to compile
+# wgvk.c twice.
+target_compile_definitions(${WGVK_PRIMARY_TARGET_NAME} PRIVATE WGVK_ALLOCATOR_INTERNAL_LINKAGE=)
+
 target_compile_features(${WGVK_PRIMARY_TARGET_NAME} PUBLIC c_std_11)
 if(MSVC)
   target_compile_options(${WGVK_PRIMARY_TARGET_NAME} PUBLIC "/experimental:c11atomics")
@@ -443,4 +450,13 @@ if(BUILD_TESTING)
   target_link_libraries(unit_tests GTest::gtest_main wgvk)
   include(GoogleTest)
   gtest_discover_tests(unit_tests)
+
+  # Dedicated, headless tests for the bitmap-based VirtualAllocator and the
+  # public wgvkAllocator_* surface. These do not require a Vulkan device for
+  # the inner-allocator suite; the device-backed suite is auto-skipped when no
+  # adapter is available.
+  add_executable(allocator_unit_tests tests/wgvk_allocator_tests.cpp)
+  target_compile_features(allocator_unit_tests PRIVATE cxx_std_20)
+  target_link_libraries(allocator_unit_tests PRIVATE GTest::gtest_main wgvk)
+  gtest_discover_tests(allocator_unit_tests)
 endif()
