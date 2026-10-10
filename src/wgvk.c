@@ -11825,7 +11825,7 @@ void wgpuCommandEncoderBuildRayTracingAccelerationContainer(WGPUCommandEncoder e
     if(container->level == WGPURayTracingAccelerationContainerLevel_Top){
         if (container->instanceBuffer) {
             BufferUsageSnap instanceSnap = {
-                .access = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+                .access = VK_ACCESS_SHADER_READ_BIT,
                 .stage = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
             };
             ce_trackBuffer(encoder, container->instanceBuffer, instanceSnap);
@@ -11861,7 +11861,7 @@ void wgpuCommandEncoderBuildRayTracingAccelerationContainer(WGPUCommandEncoder e
         };
 
         BufferUsageSnap inBufferSnap = {
-            .access = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+            .access = VK_ACCESS_SHADER_READ_BIT,
             .stage = VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
         };
 
