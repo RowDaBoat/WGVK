@@ -2101,6 +2101,7 @@ typedef struct WGPURayTracingShaderBindingTableImpl{
     uint32_t shaderStageCount;
     VkRayTracingShaderGroupCreateInfoKHR* shaderGroups;
     VkPipelineShaderStageCreateInfo* shaderStages;
+    WGPUShaderModule* shaderModules;
     WGPUDevice device;
 }WGPURayTracingShaderBindingTableImpl;
 
@@ -2456,6 +2457,7 @@ typedef struct WGPUComputePipelineImpl{
 
 typedef struct WGPURaytracingPipelineImpl{
     VkPipeline raytracingPipeline;
+    WGPUDevice device;
     refcount_type refCount;
     WGPUPipelineLayout layout;
     WGPUBuffer sbtBuffer;
