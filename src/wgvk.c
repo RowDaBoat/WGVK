@@ -5285,7 +5285,7 @@ void recordVkCommand(CommandBufferAndSomeState* destination_,const RenderPassCom
 
             ce_trackBuffer(destination_->cmdEncoder, dispatch->buffer, (BufferUsageSnap){
                 .access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
-                .stage  = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+                .stage  = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT
             });
 
             device->functions.vkCmdDispatchIndirect(
