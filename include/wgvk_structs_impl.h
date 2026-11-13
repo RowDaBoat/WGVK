@@ -1753,7 +1753,7 @@ static inline void ResourceUsage_move(ResourceUsage* dest, ResourceUsage* source
     BindGroupUsageSet_move(&dest->referencedBindGroups, &source->referencedBindGroups);
     BindGroupLayoutUsageSet_move(&dest->referencedBindGroupLayouts, &source->referencedBindGroupLayouts);
     SamplerUsageSet_move(&dest->referencedSamplers, &source->referencedSamplers);
-    QuerySetUsageSet_free(&dest->referencedQuerySets);
+    QuerySetUsageSet_move(&dest->referencedQuerySets, &source->referencedQuerySets);
     RenderBundleUsageSet_free(&dest->referencedRenderBundles);
     //LayoutAssumptions_move(&dest->entryAndFinalLayouts, &source->entryAndFinalLayouts);
 }
@@ -2205,6 +2205,8 @@ typedef struct WGPUAdapterImpl{
     VkPhysicalDeviceAccelerationStructurePropertiesKHR accelerationStructureProperties;
     VkPhysicalDeviceMemoryProperties memProperties;
     QueueIndices queueIndices;
+    uint32_t timestampValidBits;
+    float timestampPeriod;
 }WGPUAdapterImpl;
 
 #define framesInFlight 2
@@ -2517,6 +2519,9 @@ typedef struct WGPUComputePassEncoderImpl{
     WGPUPipelineLayout lastLayout;
     WGPUCommandEncoder cmdEncoder;
     WGPUBindGroup bindGroups[8];
+
+    WGPUPassTimestampWrites timestampWrites;
+    WGPUBool timestampWritesPresent;
 }WGPUComputePassEncoderImpl;
 
 static inline size_t hashDynamicState(DefaultDynamicState dst){
@@ -2922,6 +2927,13 @@ char* sw_sprintf(const char* format, ...);
 
 #endif // WGPU_VALIDATION_ENABLED
 
+// WebGPU requires resolved timestamps in ns, but ResolveQuerySet copies raw Vulkan ticks.
+// Only advertise TimestampQuery when timestampPeriod == 1 (ticks are already ns). Dawn and
+// wgpu instead convert on the GPU after resolve, which WGVK does not implement yet.
+// GPU conversion needs an embedded compute shader.
+static inline WGPUBool adapterSupportsTimestampQuery(const WGPUAdapterImpl* adapter){
+    return adapter->timestampValidBits > 0 && adapter->timestampPeriod == 1.0f;
+}
 static inline VkQueryType toVulkanQueryType(WGPUQueryType type){
     switch(type){
         case WGPUQueryType_Occlusion:return VK_QUERY_TYPE_OCCLUSION;
@@ -3157,6 +3169,9 @@ static inline VkBufferUsageFlags toVulkanBufferUsage(WGPUBufferUsage busg) {
     }
     if (busg & WGPUBufferUsage_Indirect) {
         usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    }
+    if (busg & WGPUBufferUsage_QueryResolve) {
+        usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     }
     if (busg & WGPUBufferUsage_MapRead) {
         usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;

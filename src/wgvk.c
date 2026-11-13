@@ -2138,6 +2138,10 @@ void wgpuCreateAdapter_sync(void* userdata_v){
             break;
         }
     }
+    if(adapter->queueIndices.graphicsIndex != VK_QUEUE_FAMILY_IGNORED){
+        adapter->timestampValidBits = props[adapter->queueIndices.graphicsIndex].timestampValidBits;
+    }
+    adapter->timestampPeriod = pdProperties.properties.limits.timestampPeriod;
     RL_FREE((void*)pds);
     RL_FREE((void*)props);
     adapter->deviceInfoCache = (VulkanDeviceInfo){0};
@@ -4642,6 +4646,15 @@ WGPURenderPassEncoder wgpuCommandEncoderBeginRenderPass(WGPUCommandEncoder enc, 
     EXIT();
 }
 
+static void ce_writePassTimestamp(WGPUCommandEncoder enc, const WGPUPassTimestampWrites* tw, VkPipelineStageFlagBits stage, uint32_t queryIndex){
+    if(queryIndex == WGPU_QUERY_SET_INDEX_UNDEFINED){
+        return;
+    }
+    ru_trackQuerySet(&enc->resourceUsage, tw->querySet);
+    enc->device->functions.vkCmdResetQueryPool(enc->buffer, tw->querySet->queryPool, queryIndex, 1);
+    enc->device->functions.vkCmdWriteTimestamp(enc->buffer, stage, tw->querySet->queryPool, queryIndex);
+}
+
 void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder renderPassEncoder){
     ENTRY();
 
@@ -4722,6 +4735,9 @@ void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder renderPassEncoder){
             }
             ce_trackBindlessSlots(renderPassEncoder->cmdEncoder, group);
         }
+    }
+    if(beginInfo->timestampWritesPresent){
+        ce_writePassTimestamp(renderPassEncoder->cmdEncoder, &beginInfo->timestampWrites, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, beginInfo->timestampWrites.beginningOfPassWriteIndex);
     }
     #if VULKAN_USE_DYNAMIC_RENDERING == 0
     RenderPassLayout rplayout = GetRenderPassLayout2(beginInfo);
@@ -4864,9 +4880,6 @@ void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder renderPassEncoder){
     if(beginInfo->occlusionQuerySet){
         wgpuQuerySetRelease(beginInfo->occlusionQuerySet);
     }
-    if(beginInfo->timestampWritesPresent){
-        wgpuQuerySetRelease(beginInfo->timestampWrites.querySet);
-    }
 
     //for(uint32_t i = 0;i < beginInfo->colorAttachmentCount;i++){
     //    wgvk_assert(beginInfo->colorAttachments[i].view, "colorAttachments[%d].view is null", (int)i);
@@ -4884,6 +4897,10 @@ void wgpuRenderPassEncoderEnd(WGPURenderPassEncoder renderPassEncoder){
     #else
     device->functions.vkCmdEndRenderPass(destination);
     #endif
+    if(beginInfo->timestampWritesPresent){
+        ce_writePassTimestamp(renderPassEncoder->cmdEncoder, &beginInfo->timestampWrites, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, beginInfo->timestampWrites.endOfPassWriteIndex);
+        wgpuQuerySetRelease(beginInfo->timestampWrites.querySet);
+    }
     EXIT();
 }
 /**
@@ -7572,12 +7589,23 @@ WGPUComputePassEncoder wgpuCommandEncoderBeginComputePass(WGPUCommandEncoder com
 
     ret->cmdEncoder = commandEncoder;
     ret->device = commandEncoder->device;
+    if(cpdesc && cpdesc->timestampWrites){
+        ret->timestampWrites = *cpdesc->timestampWrites;
+        ret->timestampWritesPresent = 1;
+        ru_trackQuerySet(&commandEncoder->resourceUsage, ret->timestampWrites.querySet);
+    }
     return ret;
     EXIT();
 }
 void wgpuComputePassEncoderEnd(WGPUComputePassEncoder commandEncoder){
     ENTRY();
+    if(commandEncoder->timestampWritesPresent){
+        ce_writePassTimestamp(commandEncoder->cmdEncoder, &commandEncoder->timestampWrites, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, commandEncoder->timestampWrites.beginningOfPassWriteIndex);
+    }
     recordVkCommands(commandEncoder->cmdEncoder, commandEncoder->device, &commandEncoder->bufferedCommands, NULL);
+    if(commandEncoder->timestampWritesPresent){
+        ce_writePassTimestamp(commandEncoder->cmdEncoder, &commandEncoder->timestampWrites, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, commandEncoder->timestampWrites.endOfPassWriteIndex);
+    }
     EXIT();
 }
 void wgpuComputePassEncoderRelease(WGPUComputePassEncoder cpenc){
@@ -9059,11 +9087,9 @@ void wgpuAdapterGetFeatures(WGPUAdapter adapter, WGPUSupportedFeatures* features
     if (features2.features.depthClamp) {
         supported_features[count++] = WGPUFeatureName_DepthClipControl;
     }
-    //if (features2.features) {
-        // A full implementation would also check that queueFamilyProperties.timestampValidBits > 0
-        // for at least one queue family, which is typically done during adapter enumeration.
-        //supported_features[count++] = WGPUFeatureName_TimestampQuery;
-    //}
+    if (adapterSupportsTimestampQuery(adapter)) {
+        supported_features[count++] = WGPUFeatureName_TimestampQuery;
+    }
     if (features2.features.textureCompressionBC) {
         supported_features[count++] = WGPUFeatureName_TextureCompressionBC;
     }
@@ -9188,6 +9214,9 @@ WGPUStatus wgpuAdapterGetInfo(WGPUAdapter adapter, WGPUAdapterInfo* info) {
 WGPUBool wgpuAdapterHasFeature(WGPUAdapter adapter, WGPUFeatureName feature) {
     ENTRY();
     EXIT();
+    if(feature == WGPUFeatureName_TimestampQuery){
+        return adapterSupportsTimestampQuery(adapter);
+    }
     return 0;
 }
 
@@ -9412,6 +9441,9 @@ WGPUFuture wgpuDeviceCreateComputePipelineAsync(WGPUDevice device, WGPUComputePi
 }
 WGPUQuerySet wgpuDeviceCreateQuerySet(WGPUDevice device, const WGPUQuerySetDescriptor* descriptor) {
     ENTRY();
+    if(descriptor->type == WGPUQueryType_Timestamp){
+        wgvk_assert(device->adapter->timestampPeriod == 1.0f, "Timestamp queries require timestampPeriod == 1.0, got %f", device->adapter->timestampPeriod);
+    }
     WGPUQuerySet ret = RL_CALLOC(1, sizeof(WGPUQuerySetImpl));
     ret->device = device;
     ret->type = descriptor->type;
@@ -9744,6 +9776,9 @@ WGPUFuture wgpuDeviceGetLostFuture(WGPUDevice device) {
 WGPUBool wgpuDeviceHasFeature(WGPUDevice device, WGPUFeatureName feature) {
     ENTRY();
     EXIT();
+    if(feature == WGPUFeatureName_TimestampQuery){
+        return adapterSupportsTimestampQuery(device->adapter);
+    }
     return 0;
 }
 WGPUFuture wgpuDevicePopErrorScope(WGPUDevice device, WGPUPopErrorScopeCallbackInfo callbackInfo) {
