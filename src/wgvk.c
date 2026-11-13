@@ -4660,6 +4660,16 @@ static void ce_writePassTimestamp(WGPUCommandEncoder enc, const WGPUPassTimestam
     if(queryIndex == WGPU_QUERY_SET_INDEX_UNDEFINED){
         return;
     }
+    const VkMemoryBarrier timestampBarrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT
+    };
+    enc->device->functions.vkCmdPipelineBarrier(
+        enc->buffer,
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 1, &timestampBarrier, 0, NULL, 0, NULL
+    );
     ru_trackQuerySet(&enc->resourceUsage, tw->querySet);
     enc->device->functions.vkCmdResetQueryPool(enc->buffer, tw->querySet->queryPool, queryIndex, 1);
     enc->device->functions.vkCmdWriteTimestamp(enc->buffer, stage, tw->querySet->queryPool, queryIndex);
