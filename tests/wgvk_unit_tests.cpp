@@ -7537,6 +7537,277 @@ TEST_F(WebGPUTest, AccelerationStructureBuild_AfterCopyInEarlierCommandBufferOfS
     releaseAabbBlas(resources);
 }
 
+namespace {
+WGPUQuerySet createTimestampQuerySet(WGPUDevice device, uint32_t count) {
+    WGPUQuerySetDescriptor desc = {};
+    desc.type = WGPUQueryType_Timestamp;
+    desc.count = count;
+    return wgpuDeviceCreateQuerySet(device, &desc);
+}
+
+std::vector<uint64_t> resolveTimestamps(WGPUInstance instance, WGPUDevice device, WGPUQueue queue, WGPUQuerySet querySet, uint32_t count) {
+    const uint64_t size = count * sizeof(uint64_t);
+
+    WGPUBufferDescriptor resolveDesc = {};
+    resolveDesc.size = size;
+    resolveDesc.usage = WGPUBufferUsage_QueryResolve | WGPUBufferUsage_CopySrc;
+    WGPUBuffer resolveBuffer = wgpuDeviceCreateBuffer(device, &resolveDesc);
+
+    WGPUBufferDescriptor readDesc = {};
+    readDesc.size = size;
+    readDesc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    WGPUBuffer readBuffer = wgpuDeviceCreateBuffer(device, &readDesc);
+
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+    wgpuCommandEncoderResolveQuerySet(encoder, querySet, 0, count, resolveBuffer, 0);
+    wgpuCommandEncoderCopyBufferToBuffer(encoder, resolveBuffer, 0, readBuffer, 0, size);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, nullptr);
+    wgpuQueueSubmit(queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(encoder);
+
+    struct MapCtx { bool done = false; WGPUMapAsyncStatus status = WGPUMapAsyncStatus_Error; } mapCtx;
+    auto mapCb = [](WGPUMapAsyncStatus status, WGPUStringView, void* ud, void*) {
+        ((MapCtx*)ud)->status = status;
+        ((MapCtx*)ud)->done = true;
+    };
+    WGPUBufferMapCallbackInfo cbInfo = { nullptr, WGPUCallbackMode_WaitAnyOnly, mapCb, &mapCtx, nullptr };
+    WGPUFutureWaitInfo fwi = { wgpuBufferMapAsync(readBuffer, WGPUMapMode_Read, 0, size, cbInfo), 0 };
+    while(!mapCtx.done) {
+        wgpuInstanceWaitAny(instance, 1, &fwi, UINT64_MAX);
+    }
+
+    std::vector<uint64_t> result(count, 0);
+    if(mapCtx.status == WGPUMapAsyncStatus_Success){
+        const uint64_t* mapped = (const uint64_t*)wgpuBufferGetConstMappedRange(readBuffer, 0, size);
+        memcpy(result.data(), mapped, size);
+        wgpuBufferUnmap(readBuffer);
+    }
+    wgpuBufferRelease(readBuffer);
+    wgpuBufferRelease(resolveBuffer);
+    return result;
+}
+}
+
+TEST_F(WebGPUTest, TimestampQueryFeatureReporting) {
+    const WGPUBool expected = adapter->timestampValidBits > 0 && adapter->timestampPeriod == 1.0f;
+    EXPECT_EQ(wgpuAdapterHasFeature(adapter, WGPUFeatureName_TimestampQuery), expected);
+    EXPECT_EQ(wgpuDeviceHasFeature(device, WGPUFeatureName_TimestampQuery), expected);
+
+    WGPUSupportedFeatures features = {};
+    wgpuAdapterGetFeatures(adapter, &features);
+    bool listed = false;
+    for(size_t i = 0;i < features.featureCount;i++){
+        listed |= features.features[i] == WGPUFeatureName_TimestampQuery;
+    }
+    EXPECT_EQ(listed, (bool)expected);
+    wgpuSupportedFeaturesFreeMembers(features);
+}
+
+TEST_F(WebGPUTest, ComputePassTimestampWritesMeasureDispatch) {
+    if(!wgpuDeviceHasFeature(device, WGPUFeatureName_TimestampQuery)){
+        GTEST_SKIP() << "TimestampQuery not supported";
+    }
+    const uint32_t elementCount = 16;
+    const uint64_t bufferSize = elementCount * sizeof(uint32_t);
+
+    WGPUBufferDescriptor storageDesc = {};
+    storageDesc.size = bufferSize;
+    storageDesc.usage = WGPUBufferUsage_Storage;
+    WGPUBuffer storageBuffer = wgpuDeviceCreateBuffer(device, &storageDesc);
+
+    const char* glslCode = R"(
+        #version 450
+        layout(local_size_x = 1) in;
+        layout(std430, set = 0, binding = 0) buffer Data {
+            uint values[];
+        } data;
+        void main() {
+            uint index = gl_GlobalInvocationID.x;
+            data.values[index] = data.values[index] * 2;
+        }
+    )";
+    WGPUShaderSourceGLSL glslSource = {};
+    glslSource.chain.sType = WGPUSType_ShaderSourceGLSL;
+    glslSource.stage = WGPUShaderStage_Compute;
+    glslSource.code.data = glslCode;
+    glslSource.code.length = strlen(glslCode);
+    WGPUShaderModuleDescriptor shaderDesc = {};
+    shaderDesc.nextInChain = &glslSource.chain;
+    WGPUShaderModule shaderModule = wgpuDeviceCreateShaderModule(device, &shaderDesc);
+    ASSERT_NE(shaderModule, nullptr);
+
+    WGPUBindGroupLayoutEntry bglEntry = {};
+    bglEntry.binding = 0;
+    bglEntry.visibility = WGPUShaderStage_Compute;
+    bglEntry.buffer.type = WGPUBufferBindingType_Storage;
+    bglEntry.buffer.minBindingSize = bufferSize;
+    WGPUBindGroupLayoutDescriptor bglDesc = {};
+    bglDesc.entryCount = 1;
+    bglDesc.entries = &bglEntry;
+    WGPUBindGroupLayout bgl = wgpuDeviceCreateBindGroupLayout(device, &bglDesc);
+
+    WGPUPipelineLayoutDescriptor plDesc = {};
+    plDesc.bindGroupLayoutCount = 1;
+    plDesc.bindGroupLayouts = &bgl;
+    WGPUPipelineLayout pipelineLayout = wgpuDeviceCreatePipelineLayout(device, &plDesc);
+
+    WGPUComputePipelineDescriptor pipeDesc = {};
+    pipeDesc.layout = pipelineLayout;
+    pipeDesc.compute.module = shaderModule;
+    pipeDesc.compute.entryPoint = { "main", 4 };
+    WGPUComputePipeline pipeline = wgpuDeviceCreateComputePipeline(device, &pipeDesc);
+    ASSERT_NE(pipeline, nullptr);
+
+    WGPUBindGroupEntry bgEntry = {};
+    bgEntry.binding = 0;
+    bgEntry.buffer = storageBuffer;
+    bgEntry.size = bufferSize;
+    WGPUBindGroupDescriptor bgDesc = {};
+    bgDesc.layout = bgl;
+    bgDesc.entryCount = 1;
+    bgDesc.entries = &bgEntry;
+    WGPUBindGroup bindGroup = wgpuDeviceCreateBindGroup(device, &bgDesc);
+
+    WGPUQuerySet querySet = createTimestampQuerySet(device, 2);
+    ASSERT_NE(querySet, nullptr);
+
+    WGPUPassTimestampWrites timestampWrites = {};
+    timestampWrites.querySet = querySet;
+    timestampWrites.beginningOfPassWriteIndex = 0;
+    timestampWrites.endOfPassWriteIndex = 1;
+    WGPUComputePassDescriptor passDesc = {};
+    passDesc.timestampWrites = &timestampWrites;
+
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(encoder, &passDesc);
+    EXPECT_EQ(querySet->refCount, 2);
+    wgpuComputePassEncoderSetPipeline(pass, pipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, bindGroup, 0, nullptr);
+    wgpuComputePassEncoderDispatchWorkgroups(pass, elementCount, 1, 1);
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, nullptr);
+    wgpuQueueSubmit(queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(encoder);
+
+    std::vector<uint64_t> ts = resolveTimestamps(instance, device, queue, querySet, 2);
+    EXPECT_GT(ts[0], 0u);
+    EXPECT_GT(ts[1], ts[0]);
+
+    for(uint32_t i = 0;i < framesInFlight;i++){
+        wgpuDeviceTick(device);
+    }
+    EXPECT_EQ(querySet->refCount, 1);
+
+    wgpuQuerySetRelease(querySet);
+    wgpuBindGroupRelease(bindGroup);
+    wgpuComputePipelineRelease(pipeline);
+    wgpuPipelineLayoutRelease(pipelineLayout);
+    wgpuBindGroupLayoutRelease(bgl);
+    wgpuShaderModuleRelease(shaderModule);
+    wgpuBufferRelease(storageBuffer);
+}
+
+TEST_F(WebGPUTest, ComputePassTimestampWritesUndefinedIndexSkipsWrite) {
+    if(!wgpuDeviceHasFeature(device, WGPUFeatureName_TimestampQuery)){
+        GTEST_SKIP() << "TimestampQuery not supported";
+    }
+    WGPUQuerySet querySet = createTimestampQuerySet(device, 2);
+    ASSERT_NE(querySet, nullptr);
+
+    WGPUPassTimestampWrites beginOnly = {};
+    beginOnly.querySet = querySet;
+    beginOnly.beginningOfPassWriteIndex = 0;
+    beginOnly.endOfPassWriteIndex = WGPU_QUERY_SET_INDEX_UNDEFINED;
+
+    WGPUPassTimestampWrites endOnly = {};
+    endOnly.querySet = querySet;
+    endOnly.beginningOfPassWriteIndex = WGPU_QUERY_SET_INDEX_UNDEFINED;
+    endOnly.endOfPassWriteIndex = 1;
+
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+    WGPUComputePassDescriptor passDesc = {};
+    passDesc.timestampWrites = &beginOnly;
+    WGPUComputePassEncoder first = wgpuCommandEncoderBeginComputePass(encoder, &passDesc);
+    wgpuComputePassEncoderEnd(first);
+    wgpuComputePassEncoderRelease(first);
+    passDesc.timestampWrites = &endOnly;
+    WGPUComputePassEncoder second = wgpuCommandEncoderBeginComputePass(encoder, &passDesc);
+    wgpuComputePassEncoderEnd(second);
+    wgpuComputePassEncoderRelease(second);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, nullptr);
+    wgpuQueueSubmit(queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(encoder);
+
+    std::vector<uint64_t> ts = resolveTimestamps(instance, device, queue, querySet, 2);
+    EXPECT_GT(ts[0], 0u);
+    EXPECT_GE(ts[1], ts[0]);
+
+    for(uint32_t i = 0;i < framesInFlight;i++){
+        wgpuDeviceTick(device);
+    }
+    EXPECT_EQ(querySet->refCount, 1);
+    wgpuQuerySetRelease(querySet);
+}
+
+TEST_F(WebGPUTest, RenderPassTimestampWrites) {
+    if(!wgpuDeviceHasFeature(device, WGPUFeatureName_TimestampQuery)){
+        GTEST_SKIP() << "TimestampQuery not supported";
+    }
+    WGPUTextureDescriptor texDesc = {};
+    texDesc.size = {64, 64, 1};
+    texDesc.format = WGPUTextureFormat_RGBA8Unorm;
+    texDesc.usage = WGPUTextureUsage_RenderAttachment;
+    texDesc.mipLevelCount = 1;
+    texDesc.sampleCount = 1;
+    texDesc.dimension = WGPUTextureDimension_2D;
+    WGPUTexture texture = wgpuDeviceCreateTexture(device, &texDesc);
+    WGPUTextureView view = wgpuTextureCreateView(texture, nullptr);
+
+    WGPUQuerySet querySet = createTimestampQuerySet(device, 2);
+    ASSERT_NE(querySet, nullptr);
+
+    WGPUPassTimestampWrites timestampWrites = {};
+    timestampWrites.querySet = querySet;
+    timestampWrites.beginningOfPassWriteIndex = 0;
+    timestampWrites.endOfPassWriteIndex = 1;
+
+    WGPURenderPassColorAttachment colorAtt = {};
+    colorAtt.view = view;
+    colorAtt.loadOp = WGPULoadOp_Clear;
+    colorAtt.storeOp = WGPUStoreOp_Store;
+    colorAtt.clearValue = {0.0, 0.0, 1.0, 1.0};
+    WGPURenderPassDescriptor rpDesc = {};
+    rpDesc.colorAttachmentCount = 1;
+    rpDesc.colorAttachments = &colorAtt;
+    rpDesc.timestampWrites = &timestampWrites;
+
+    WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, nullptr);
+    WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(encoder, &rpDesc);
+    wgpuRenderPassEncoderEnd(rp);
+    wgpuRenderPassEncoderRelease(rp);
+    WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(encoder, nullptr);
+    wgpuQueueSubmit(queue, 1, &cmd);
+    wgpuCommandBufferRelease(cmd);
+    wgpuCommandEncoderRelease(encoder);
+
+    std::vector<uint64_t> ts = resolveTimestamps(instance, device, queue, querySet, 2);
+    EXPECT_GT(ts[0], 0u);
+    EXPECT_GE(ts[1], ts[0]);
+
+    for(uint32_t i = 0;i < framesInFlight;i++){
+        wgpuDeviceTick(device);
+    }
+    EXPECT_EQ(querySet->refCount, 1);
+
+    wgpuQuerySetRelease(querySet);
+    wgpuTextureViewRelease(view);
+    wgpuTextureRelease(texture);
+}
+
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
